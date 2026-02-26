@@ -1,0 +1,51 @@
+[meta]
+title = "PHP Flux"
+description = "Get started using Deepgram's Flux real-time transcription with this PHP demo app"
+author = "Deepgram DX Team <devrel@deepgram.com> (https://developers.deepgram.com)"
+repository = "https://github.com/deepgram-starters/php-flux"
+useCase = "flux"
+language = "PHP"
+framework = "php"
+sdk = "N/A"
+tags = ["flux", "turn-detection", "real-time-transcription", "streaming-stt", "end-of-turn", "php", "ratchet"]
+
+[check]
+command = ["command -v git", "command -v php", "command -v composer"]
+message = "Prerequisites checked"
+
+[install.pre]
+command = "git submodule update --init --recursive"
+message = "Submodules initialized"
+
+[install]
+command = ["composer install", "cd frontend && corepack pnpm install"]
+message = "Dependencies installed"
+
+[install.config]
+sample = "sample.env"
+output = ".env"
+
+[start.pre]
+command = ["test -f .env || echo 'Error: .env file not found'", "test -d frontend/.git || echo 'Error: Frontend submodule not initialized'"]
+message = "Pre-flight checks complete"
+
+[start]
+command = ["php server.php", "cd frontend && pnpm run dev -- --port 8080 --no-open"]
+parallel = true
+message = "Application running on http://localhost:8080"
+
+[update]
+command = "git submodule update --remote --merge"
+message = "Submodules updated"
+
+[clean]
+command = ["rm -rf vendor", "rm -rf frontend/node_modules", "rm -rf frontend/dist"]
+message = "Build artifacts cleaned"
+
+[eject-frontend]
+command = "make eject-frontend"
+message = "Frontend ejected successfully"
+
+[test]
+command = "bash contracts/tests/run-flux-app.sh"
+message = "Contract conformance tests"
