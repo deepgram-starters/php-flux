@@ -184,16 +184,14 @@ function buildDeepgramUrl(string $queryString, string $baseUrl): string
 {
     parse_str($queryString, $params);
 
-    $model = 'flux-general-en';
+    $model = $params['model'] ?? 'flux-general-en';
     $encoding = $params['encoding'] ?? 'linear16';
     $sampleRate = $params['sample_rate'] ?? '16000';
-    $channels = $params['channels'] ?? '1';
 
     $dgParams = [
         'model' => $model,
         'encoding' => $encoding,
         'sample_rate' => $sampleRate,
-        'channels' => $channels,
     ];
 
     // Optional parameters
@@ -269,7 +267,7 @@ function sendHttpResponse(ConnectionInterface $conn, int $status, mixed $data, a
  * Authenticates clients via JWT subprotocol, connects to Deepgram Flux API,
  * and forwards all messages bidirectionally.
  */
-class FluxHandler implements WsServerInterface
+class FluxHandler implements \Ratchet\WebSocket\MessageComponentInterface, WsServerInterface
 {
     /** @var \SplObjectStorage Active client connections */
     private \SplObjectStorage $clients;
@@ -423,20 +421,16 @@ class FluxHandler implements WsServerInterface
      * Handle incoming message from client. Forward to Deepgram.
      *
      * @param ConnectionInterface $conn The client connection
-     * @param string $msg The message data
+     * @param \Ratchet\RFC6455\Messaging\MessageInterface $msg The message data
      */
-    public function onMessage(ConnectionInterface $conn, $msg): void
+    public function onMessage(ConnectionInterface $conn, \Ratchet\RFC6455\Messaging\MessageInterface $msg): void
     {
         $resourceId = $conn->resourceId;
         $this->clientMsgCounts[$resourceId] = ($this->clientMsgCounts[$resourceId] ?? 0) + 1;
         $count = $this->clientMsgCounts[$resourceId];
 
-        $isBinary = $msg instanceof \Ratchet\RFC6455\Messaging\MessageInterface
-            ? $msg->isBinary()
-            : false;
-        $payload = $msg instanceof \Ratchet\RFC6455\Messaging\MessageInterface
-            ? $msg->getPayload()
-            : (string) $msg;
+        $isBinary = $msg->isBinary();
+        $payload = $msg->getPayload();
 
         if ($count % 100 === 0 || !$isBinary) {
             echo "  Client #{$resourceId} message #{$count} (binary: " . ($isBinary ? 'true' : 'false') . ", size: " . strlen($payload) . ") -> Deepgram\n";
@@ -553,7 +547,7 @@ class HttpHandler implements HttpServerInterface
      * @param ConnectionInterface $conn The HTTP connection
      * @param RequestInterface $request The PSR-7 request
      */
-    public function onOpen(ConnectionInterface $conn, RequestInterface $request = null): void
+    public function onOpen(ConnectionInterface $conn, ?RequestInterface $request = null): void
     {
         $path = $request?->getUri()->getPath() ?? '/';
         $method = $request?->getMethod() ?? 'GET';
@@ -658,11 +652,50 @@ $httpHandler = new HttpHandler($SESSION_SECRET);
 $routes = new RouteCollection();
 
 // WebSocket route for /api/flux
+$wsServer = new WsServer($fluxHandler);
+
+// Custom ServerNegotiator to accept access_token.* WebSocket subprotocols
+$customNegotiator = new class(new \Ratchet\RFC6455\Handshake\RequestVerifier()) extends \Ratchet\RFC6455\Handshake\ServerNegotiator {
+    public function __construct(\Ratchet\RFC6455\Handshake\RequestVerifier $verifier) {
+        parent::__construct($verifier);
+        $this->setStrictSubProtocolCheck(false);
+    }
+    public function handshake(\Psr\Http\Message\RequestInterface $request): \Psr\Http\Message\ResponseInterface {
+        $response = parent::handshake($request);
+        if ($response->getStatusCode() === 101 && !$response->hasHeader('Sec-WebSocket-Protocol')) {
+            $protocols = $request->getHeader('Sec-WebSocket-Protocol');
+            $all = array_map('trim', explode(',', implode(',', $protocols)));
+            foreach ($all as $proto) {
+                if (str_starts_with($proto, 'access_token.')) {
+                    $response = $response->withHeader('Sec-WebSocket-Protocol', $proto);
+                    break;
+                }
+            }
+        }
+        return $response;
+    }
+};
+$ref = new \ReflectionProperty($wsServer, 'handshakeNegotiator');
+$ref->setValue($wsServer, $customNegotiator);
+
 $routes->add('flux', new Route('/api/flux', [
-    '_controller' => new WsServer($fluxHandler),
+    '_controller' => $wsServer,
 ], [], [], '', [], ['GET']));
 
-// HTTP routes for everything else
+// HTTP routes - individual endpoints + fallback
+$routes->add('api_session', new Route('/api/session', [
+    '_controller' => $httpHandler,
+], [], [], '', [], ['GET', 'OPTIONS']));
+
+$routes->add('api_metadata', new Route('/api/metadata', [
+    '_controller' => $httpHandler,
+], [], [], '', [], ['GET', 'OPTIONS']));
+
+$routes->add('health', new Route('/health', [
+    '_controller' => $httpHandler,
+], [], [], '', [], ['GET']));
+
+// Fallback for unknown routes
 $routes->add('http_catch_all', new Route('/{path}', [
     '_controller' => $httpHandler,
 ], ['path' => '.*'], [], '', [], ['GET', 'POST', 'OPTIONS']));
@@ -713,20 +746,13 @@ function gracefulShutdown(int $signal, $loop, FluxHandler $handler): void
     $loop->stop();
 }
 
-// Register signal handlers if pcntl is available
-if (function_exists('pcntl_signal')) {
-    pcntl_signal(SIGINT, function (int $sig) use ($loop, $fluxHandler) {
-        gracefulShutdown($sig, $loop, $fluxHandler);
-    });
-    pcntl_signal(SIGTERM, function (int $sig) use ($loop, $fluxHandler) {
-        gracefulShutdown($sig, $loop, $fluxHandler);
-    });
-
-    // Enable async signal handling in the event loop
-    $loop->addPeriodicTimer(1, function () {
-        pcntl_signal_dispatch();
-    });
-}
+// Register signal handlers via ReactPHP event loop
+$loop->addSignal(SIGINT, function (int $sig) use ($loop, $fluxHandler) {
+    gracefulShutdown($sig, $loop, $fluxHandler);
+});
+$loop->addSignal(SIGTERM, function (int $sig) use ($loop, $fluxHandler) {
+    gracefulShutdown($sig, $loop, $fluxHandler);
+});
 
 // ============================================================================
 // START SERVER
